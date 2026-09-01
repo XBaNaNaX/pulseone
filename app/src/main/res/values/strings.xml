@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pulse One Local</string>
+    <string name="medical_disclaimer">ข้อมูลนี้ใช้ติดตามสุขภาพทั่วไป ไม่ใช่เพื่อวินิจฉัยหรือรักษาโรค</string>
+</resources>
