@@ -27,6 +27,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.unclebanana.pulseone.ble.PulseBleManager;
+import com.unclebanana.pulseone.core.ManualSpO2Session;
 import com.unclebanana.pulseone.data.MeasurementDb;
 import com.unclebanana.pulseone.ui.VitalChartView;
 
@@ -107,7 +108,7 @@ public final class MainActivity extends Activity implements PulseBleManager.List
 
         TextView title = text("Pulse One Local", 28, Color.WHITE, true);
         root.addView(title);
-        TextView subtitle = text("WS01A · Controlled Measurement v0.2.5", 14, secondary, false);
+        TextView subtitle = text("WS01A · Controlled Measurement v0.2.8", 14, secondary, false);
         root.addView(subtitle, margins(0, 4, 0, 18));
 
         status = text("ยังไม่เชื่อมต่อ", 15, secondary, false);
@@ -359,14 +360,20 @@ public final class MainActivity extends Activity implements PulseBleManager.List
         });
     }
 
-    @Override public void onSpO2MeasurementState(boolean available, boolean active, String message) {
+    @Override public void onManualSpO2State(boolean available,
+                                            ManualSpO2Session.Snapshot snapshot,
+                                            String message) {
         if (destroyed) return;
         runOnUiThread(() -> {
-            spO2Measuring = active;
-            measureSpO2Button.setEnabled(available);
-            measureSpO2Button.setText(active ? "หยุดวัด SpO₂" : "เริ่มวัด SpO₂ (30 วินาที)");
+            spO2Measuring = snapshot.isMeasuring();
+            measureSpO2Button.setEnabled(available
+                    && snapshot.state != ManualSpO2Session.State.WAITING_MANUAL_HISTORY);
+            measureSpO2Button.setText(spO2Measuring
+                    ? "หยุดวัด SpO₂" : "เริ่มวัด SpO₂ (30 วินาที)");
             status.setText(message);
-            if (!available && !active) measureSpO2Button.setText("อุปกรณ์ไม่พร้อมวัด SpO₂");
+            if (!available && !spO2Measuring) {
+                measureSpO2Button.setText("อุปกรณ์ไม่พร้อมวัด SpO₂");
+            }
         });
     }
 

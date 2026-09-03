@@ -10,8 +10,8 @@ android {
         applicationId 'com.unclebanana.pulseone'
         minSdk 26
         targetSdk 36
-        versionCode 6
-        versionName '0.2.5'
+        versionCode 9
+        versionName '0.2.8'
     }
 
     buildTypes {

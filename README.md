@@ -1,5 +1,11 @@
 # Pulse One Local
 
+Current diagnostic release: `0.2.8` (`versionCode 9`). Auto SpO2 history is
+parsed as timestamped historical data in a bounded, deduplicated diagnostic
+session. Explicit `66-FF` completion is verified; clean inter-packet idle after
+valid data is completed with unverified completeness. History is never routed
+to the current SpO2 UI/database.
+
 Android app for reading a Pulse Series One / WS01A wearable without the vendor
 cloud. The app was designed from the GATT profile observed on the user's device:
 
@@ -96,13 +102,13 @@ See [docs/TEST_PLAN.md](docs/TEST_PLAN.md) and
 
 ## Known limitations
 
-- Sleep, HRV, temperature, stored history, and on-demand SpO2 require carefully
-  validated commands over `FFF6`; they are not included yet.
+- Sleep, HRV, temperature, and non-SpO2 history still require validated protocol
+  captures. Auto SpO2 history is diagnostic-only and is not persisted.
 - The MVP does not run a foreground service, so it does not continuously collect
   while closed.
-- The project environment used to create this source did not contain Android SDK
-  or Gradle. The pure-Java protocol tests and privacy policy checks passed, but
-  the Android APK must still be compiled and linted in Android Studio.
+- The pure-Java protocol tests, Gradle test task, Android lint, and debug APK
+  assembly pass in the current project environment. Hardware behavior still
+  requires validation against a physical WS01A.
 
 Health readings are for wellness trends only and are not a substitute for a
 validated medical device or professional care.

@@ -20,8 +20,10 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 
+import com.unclebanana.pulseone.core.AutoSpO2HistorySession;
 import com.unclebanana.pulseone.core.BleParsers;
 import com.unclebanana.pulseone.core.JStyleFrame;
+import com.unclebanana.pulseone.core.ManualSpO2Session;
 
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -51,7 +53,10 @@ public final class PulseBleManager {
     private static final int SPO2_MEASUREMENT_SECONDS = 30;
     private static final long SPO2_STOP_GRACE_MS = 2_000;
     private static final long EXT_DIAGNOSTIC_TIMEOUT_MS = 4_000;
-    private static final int MAX_AUTO_HISTORY_CONTINUATIONS = 10;
+    private static final int MAX_BUFFERED_DIAGNOSTIC_RESPONSES = 8;
+    private static final boolean DEBUG_RAW_AUTO_HISTORY = false;
+    private static final boolean DEBUG_AUTO_HISTORY_BATCHES = false;
+    private static final boolean DEBUG_MANUAL_FAILURE_EXT_DIAGNOSTIC = false;
 
     private enum DiagnosticState {
         IDLE, READ_VERSION, READ_AUTO_CONFIG, READ_AUTO_HISTORY,
@@ -68,7 +73,8 @@ public final class PulseBleManager {
         void onCadence(int stepsPerMinute, double metersPerSecond);
         void onProprietaryFrame(int command, String hex, boolean valid);
         void onDiagnostic(String event);
-        void onSpO2MeasurementState(boolean available, boolean active, String message);
+        void onManualSpO2State(boolean available, ManualSpO2Session.Snapshot snapshot,
+                               String message);
         void onError(String message);
     }
 
@@ -76,6 +82,7 @@ public final class PulseBleManager {
     private Listener listener = null;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final BluetoothAdapter adapter;
+    private final AutoSpO2HistorySession.Timeouts historyTimeouts;
     private final Queue<BluetoothGattDescriptor> descriptorWrites = new ArrayDeque<>();
 
     private BluetoothLeScanner scanner;
@@ -85,38 +92,46 @@ public final class PulseBleManager {
     private boolean initialBatteryRead;
     private boolean subscriptionsReady;
     private boolean spO2MeasurementAvailable;
-    private boolean spO2MeasurementActive;
-    private boolean spO2ResultSeen;
     private boolean spO2HistoryReadActive;
+    private boolean manualFallbackDiagnosticUsed;
     private boolean vendorWritePending;
     private String pendingVendorAction = "";
-    private boolean readManualHistoryAfterStop;
     private DiagnosticState diagnosticState = DiagnosticState.IDLE;
-    private int autoHistoryRecords;
-    private int autoHistoryContinuations;
-    private byte[] pendingDiagnosticResponse;
+    private final ManualSpO2Session manualSpO2Session = new ManualSpO2Session();
+    private final AutoSpO2HistorySession autoHistorySession = new AutoSpO2HistorySession();
+    private final Queue<byte[]> pendingDiagnosticResponses = new ArrayDeque<>();
 
-    private final Runnable automaticSpO2Stop = () ->
-            stopSpO2Measurement("ครบเวลาวัด 30 วินาที", true);
+    private final Runnable automaticSpO2Stop = this::timeoutSpO2Measurement;
+    private final Runnable requestManualHistoryAfterFinish = this::requestManualSpO2History;
     private final Runnable spO2HistoryTimeout = () -> {
         if (!spO2HistoryReadActive) return;
         spO2HistoryReadActive = false;
-        if (!spO2ResultSeen) {
-            listener.onDiagnostic("HISTORY 60 timeout/no SpO2 result");
-            listener.onSpO2MeasurementState(spO2MeasurementAvailable, false,
-                    "ไม่พบผล SpO₂ ที่อุปกรณ์บันทึกไว้");
-            startExtendedDiagnostic("manual history timeout");
-        }
+        finishManualMeasurement(manualSpO2Session.timeout(),
+                "อุปกรณ์ไม่ส่งผล SpO₂ กลับภายในเวลาที่กำหนด");
+        maybeStartManualFailureDiagnostic("manual history timeout");
     };
     private final Runnable extendedDiagnosticTimeout = () -> {
         if (isExtendedDiagnosticActive()) {
             failExtendedDiagnostic("timeout state=" + diagnosticState);
         }
     };
+    private final Runnable historyIdleTimeout = () ->
+            finishHistory(autoHistorySession.onIdleTimeout());
+    private final Runnable historyAbsoluteTimeout = () ->
+            finishHistory(autoHistorySession.onAbsoluteTimeout());
 
     public PulseBleManager(Context context, Listener listener) {
+        this(context, listener, AutoSpO2HistorySession.DEFAULT_TIMEOUTS);
+    }
+
+    public PulseBleManager(Context context, Listener listener,
+                           AutoSpO2HistorySession.Timeouts historyTimeouts) {
+        if (historyTimeouts == null) {
+            throw new IllegalArgumentException("historyTimeouts must not be null");
+        }
         this.context = context.getApplicationContext();
         this.listener = listener;
+        this.historyTimeouts = historyTimeouts;
         BluetoothManager manager = context.getSystemService(BluetoothManager.class);
         this.adapter = manager == null ? null : manager.getAdapter();
     }
@@ -146,14 +161,14 @@ public final class PulseBleManager {
         initialBatteryRead = false;
         subscriptionsReady = false;
         spO2MeasurementAvailable = false;
-        spO2MeasurementActive = false;
-        spO2ResultSeen = false;
         spO2HistoryReadActive = false;
+        manualFallbackDiagnosticUsed = false;
         vendorWritePending = false;
         pendingVendorAction = "";
-        readManualHistoryAfterStop = false;
+        manualSpO2Session.reset();
         resetExtendedDiagnostic();
         mainHandler.removeCallbacks(automaticSpO2Stop);
+        mainHandler.removeCallbacks(requestManualHistoryAfterFinish);
         mainHandler.removeCallbacks(spO2HistoryTimeout);
         scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
@@ -175,11 +190,11 @@ public final class PulseBleManager {
         initialBatteryRead = false;
         subscriptionsReady = false;
         spO2MeasurementAvailable = false;
-        spO2MeasurementActive = false;
-        readManualHistoryAfterStop = false;
         resetExtendedDiagnostic();
         mainHandler.removeCallbacks(automaticSpO2Stop);
-        listener.onSpO2MeasurementState(false, false, "ยังไม่พร้อมวัด SpO2");
+        mainHandler.removeCallbacks(requestManualHistoryAfterFinish);
+        listener.onManualSpO2State(false, manualSpO2Session.snapshot(),
+                "ยังไม่พร้อมวัด SpO2");
     }
 
     public void destroy() {
@@ -327,14 +342,16 @@ public final class PulseBleManager {
                 listener.onDiagnostic("WRITE FFF6 status=" + status + " action=" + action);
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     mainHandler.removeCallbacks(automaticSpO2Stop);
-                    spO2MeasurementActive = false;
+                    mainHandler.removeCallbacks(requestManualHistoryAfterFinish);
                     spO2HistoryReadActive = false;
-                    readManualHistoryAfterStop = false;
+                    mainHandler.removeCallbacks(spO2HistoryTimeout);
                     if (isExtendedDiagnosticActive()) {
                         failExtendedDiagnostic("GATT write status=" + status + " action=" + action);
                     }
-                    listener.onSpO2MeasurementState(spO2MeasurementAvailable, false,
-                            "อุปกรณ์ปฏิเสธคำสั่งวัด SpO2");
+                    if (manualSpO2Session.snapshot().isBusy()) {
+                        finishManualMeasurement(manualSpO2Session.fail(),
+                                "อุปกรณ์ปฏิเสธคำสั่งวัด SpO2");
+                    }
                     listener.onError("อุปกรณ์ไม่รับคำสั่งวัด SpO2 (GATT " + status + ")");
                 } else {
                     onVendorWriteComplete(action);
@@ -380,8 +397,9 @@ public final class PulseBleManager {
             if (!subscriptionsReady) {
                 subscriptionsReady = true;
                 boolean available = spO2MeasurementAvailable;
-                mainHandler.postDelayed(() -> listener.onSpO2MeasurementState(
-                        available, false, available ? "พร้อมวัด SpO2" : "อุปกรณ์ไม่มี FFF6"), 700);
+                mainHandler.postDelayed(() -> listener.onManualSpO2State(
+                        available, manualSpO2Session.snapshot(),
+                        available ? "พร้อมวัด SpO2" : "อุปกรณ์ไม่มี FFF6"), 700);
             }
             return;
         }
@@ -414,9 +432,28 @@ public final class PulseBleManager {
 
     private void handle(UUID id, byte[] source) {
         byte[] value = source == null ? new byte[0] : Arrays.copyOf(source, source.length);
-        if (PLX_CONTINUOUS.equals(id) || JSTYLE_NOTIFY.equals(id)) {
+        if (PLX_CONTINUOUS.equals(id)) {
             listener.onDiagnostic(String.format(Locale.US, "RX %s %dB %s",
                     shortUuid(id), value.length, BleParsers.hex(value)));
+        } else if (JSTYLE_NOTIFY.equals(id)) {
+            int command = value.length == 0 ? -1 : value[0] & 0xFF;
+            boolean historyPayload = command == JStyleFrame.AUTO_SPO2_HISTORY_COMMAND
+                    || (diagnosticState == DiagnosticState.WAIT_HISTORY
+                    && autoHistorySession.bufferedByteCount() > 0);
+            if (historyPayload) {
+                if (DEBUG_RAW_AUTO_HISTORY) {
+                    listener.onDiagnostic(String.format(Locale.US,
+                            "RX %s %dB %s", shortUuid(id), value.length,
+                            BleParsers.hex(value)));
+                }
+            } else if (command == 0x41) {
+                listener.onDiagnostic(String.format(Locale.US,
+                        "EXT-DIAG DEVICE-TIME RAW RX %s layout-unconfirmed",
+                        BleParsers.hex(value)));
+            } else {
+                listener.onDiagnostic(String.format(Locale.US, "RX %s %dB %s",
+                        shortUuid(id), value.length, BleParsers.hex(value)));
+            }
         }
         try {
             if (HEART_RATE_MEASUREMENT.equals(id)) {
@@ -433,50 +470,68 @@ public final class PulseBleManager {
                 BleParsers.RscMeasurement rsc = BleParsers.runningSpeedCadence(value);
                 listener.onCadence(rsc.cadencePerMinute, rsc.speedMetersPerSecond);
             } else if (JSTYLE_NOTIFY.equals(id)) {
+                if (diagnosticState == DiagnosticState.WAIT_HISTORY
+                        && autoHistorySession.isDraining()
+                        && value.length > 0
+                        && (value[0] & 0xFF) == JStyleFrame.AUTO_SPO2_HISTORY_COMMAND) {
+                    handleExtendedDiagnosticPacket(value);
+                    return;
+                }
                 boolean fixedFrame = JStyleFrame.isValid(value);
                 boolean historyPacket = JStyleFrame.isManualSpO2HistoryRecord(value)
                         || JStyleFrame.isManualSpO2HistoryEnd(value)
-                        || JStyleFrame.isAutoSpO2HistoryRecord(value)
+                        || JStyleFrame.isAutoSpO2HistoryPayload(value)
                         || JStyleFrame.isAutoSpO2HistoryEnd(value);
                 boolean valid = fixedFrame || historyPacket;
                 int command = valid && value.length > 0 ? value[0] & 0xFF : -1;
                 listener.onProprietaryFrame(command, BleParsers.hex(value), valid);
                 if (handleExtendedDiagnosticPacket(value)) {
                     return;
-                } else if (spO2MeasurementActive && JStyleFrame.isSpO2MeasurementResponse(value)) {
-                    int percent = JStyleFrame.spO2Percent(value);
-                    int pulse = value[2] & 0xFF;
-                    listener.onDiagnostic("VENDOR HR=" + pulse + " bpm SpO2=" + percent + "%");
-                    if (percent > 0 && percent <= 100) {
-                        spO2ResultSeen = true;
-                        listener.onSpO2(percent, pulse);
-                    }
-                } else if (spO2MeasurementActive && JStyleFrame.isMeasurementFinished(value)) {
+                } else if (manualSpO2Session.snapshot().isMeasuring()
+                        && JStyleFrame.isSpO2MeasurementResponse(value)) {
+                    JStyleFrame.ManualSpO2Reading reading =
+                            JStyleFrame.manualSpO2Reading(value);
+                    manualSpO2Session.acceptLive(reading);
+                    listener.onDiagnostic("VENDOR HR=" + reading.heartRate
+                            + " bpm SpO2=" + reading.spO2Percent + "%");
+                } else if (manualSpO2Session.snapshot().isMeasuring()
+                        && JStyleFrame.isMeasurementFinished(value)) {
                     mainHandler.removeCallbacks(automaticSpO2Stop);
-                    spO2MeasurementActive = false;
-                    listener.onDiagnostic("MEASUREMENT FINISHED 28-FF; request manual SpO2 history");
-                    listener.onSpO2MeasurementState(spO2MeasurementAvailable, false,
-                            "อุปกรณ์จบการวัด · กำลังอ่านผลที่บันทึกไว้");
-                    mainHandler.postDelayed(this::requestManualSpO2History, 300);
-                } else if (JStyleFrame.isManualSpO2HistoryRecord(value)) {
-                    int percent = JStyleFrame.manualSpO2Percent(value);
-                    listener.onDiagnostic("HISTORY 60 SpO2=" + percent + "%");
-                    if (percent > 0) {
-                        spO2ResultSeen = true;
-                        spO2HistoryReadActive = false;
-                        mainHandler.removeCallbacks(spO2HistoryTimeout);
-                        listener.onSpO2(percent, Double.NaN);
-                        listener.onSpO2MeasurementState(spO2MeasurementAvailable, false,
-                                "อ่านผล SpO₂ ที่อุปกรณ์บันทึกไว้แล้ว");
+                    if (manualSpO2Session.onMeasurementFinished()) {
+                        listener.onDiagnostic("MEASUREMENT FINISHED 28-FF; request manual SpO2 history");
+                        listener.onManualSpO2State(spO2MeasurementAvailable,
+                                manualSpO2Session.snapshot(),
+                                "อุปกรณ์จบการวัด · กำลังอ่านผลที่บันทึกไว้");
+                        mainHandler.postDelayed(requestManualHistoryAfterFinish, 300);
+                    } else {
+                        finishManualMeasurement(manualSpO2Session.snapshot(),
+                                "วัด SpO2 สำเร็จ");
                     }
-                } else if (JStyleFrame.isManualSpO2HistoryEnd(value)) {
+                } else if (manualSpO2Session.snapshot().state
+                        == ManualSpO2Session.State.WAITING_MANUAL_HISTORY
+                        && JStyleFrame.isManualSpO2HistoryRecord(value)) {
+                    Integer percent = JStyleFrame.manualSpO2PercentOrNull(value);
+                    manualSpO2Session.acceptManualHistory(percent);
+                    listener.onDiagnostic("HISTORY 60 SpO2=" + percent + "%");
+                    if (spO2HistoryReadActive) {
+                        mainHandler.removeCallbacks(spO2HistoryTimeout);
+                        mainHandler.postDelayed(spO2HistoryTimeout,
+                                EXT_DIAGNOSTIC_TIMEOUT_MS);
+                    }
+                } else if (manualSpO2Session.snapshot().state
+                        == ManualSpO2Session.State.WAITING_MANUAL_HISTORY
+                        && JStyleFrame.isManualSpO2HistoryEnd(value)) {
                     spO2HistoryReadActive = false;
                     mainHandler.removeCallbacks(spO2HistoryTimeout);
-                    listener.onDiagnostic("HISTORY 60 END resultSeen=" + spO2ResultSeen);
-                    if (!spO2ResultSeen) {
-                        listener.onSpO2MeasurementState(spO2MeasurementAvailable, false,
-                                "รอบนี้อุปกรณ์ไม่ได้บันทึกค่า SpO₂");
-                        startExtendedDiagnostic("manual history ended without result");
+                    ManualSpO2Session.Snapshot result =
+                            manualSpO2Session.onManualHistoryEnd();
+                    listener.onDiagnostic("HISTORY 60 END result=" + result.status);
+                    finishManualMeasurement(result, result.spO2Percent == null
+                            ? "รอบนี้อุปกรณ์ไม่ได้บันทึกค่า SpO₂"
+                            : "อ่านผล SpO₂ ที่อุปกรณ์บันทึกไว้แล้ว");
+                    if (result.spO2Percent == null) {
+                        maybeStartManualFailureDiagnostic(
+                                "manual history ended without result");
                     }
                 }
             }
@@ -493,46 +548,64 @@ public final class PulseBleManager {
             listener.onError("ยังไม่พร้อมเริ่มวัด SpO2");
             return;
         }
-        if (spO2MeasurementActive) return;
+        if (manualSpO2Session.snapshot().isBusy()) return;
         if (isExtendedDiagnosticActive()) failExtendedDiagnostic("new measurement session");
-        spO2ResultSeen = false;
+        if (!manualSpO2Session.start()) return;
+        manualFallbackDiagnosticUsed = false;
         spO2HistoryReadActive = false;
         mainHandler.removeCallbacks(spO2HistoryTimeout);
         byte[] frame = JStyleFrame.spO2Measurement(true, SPO2_MEASUREMENT_SECONDS);
-        if (!writeAllowlistedVendor(activeGatt, frame, "START")) return;
-        spO2MeasurementActive = true;
+        if (!writeAllowlistedVendor(activeGatt, frame, "START")) {
+            finishManualMeasurement(manualSpO2Session.fail(),
+                    "ส่งคำสั่งเริ่มวัด SpO2 ไม่สำเร็จ");
+            return;
+        }
         mainHandler.removeCallbacks(automaticSpO2Stop);
         mainHandler.postDelayed(automaticSpO2Stop,
                 SPO2_MEASUREMENT_SECONDS * 1_000L + SPO2_STOP_GRACE_MS);
-        listener.onSpO2MeasurementState(true, true, "กำลังวัด SpO2 · อยู่นิ่ง 30 วินาที");
+        listener.onManualSpO2State(true, manualSpO2Session.snapshot(),
+                "กำลังวัด SpO2 · อยู่นิ่ง 30 วินาที");
     }
 
     public void stopSpO2Measurement() {
-        stopSpO2Measurement("หยุดการวัดแล้ว", false);
+        mainHandler.removeCallbacks(automaticSpO2Stop);
+        if (!manualSpO2Session.snapshot().isMeasuring()) return;
+        sendManualStop();
+        finishManualMeasurement(manualSpO2Session.cancel(), "หยุดการวัดแล้ว");
     }
 
     @SuppressLint("MissingPermission")
-    private void stopSpO2Measurement(String message, boolean readResultAfterStop) {
+    private void timeoutSpO2Measurement() {
         mainHandler.removeCallbacks(automaticSpO2Stop);
+        if (!manualSpO2Session.snapshot().isMeasuring()) return;
+        sendManualStop();
+        finishManualMeasurement(manualSpO2Session.timeout(),
+                "อุปกรณ์ไม่ส่งสัญญาณจบการวัดภายในเวลาที่กำหนด");
+        maybeStartManualFailureDiagnostic("manual measurement timeout");
+    }
+
+    @SuppressLint("MissingPermission")
+    private boolean sendManualStop() {
         BluetoothGatt activeGatt = gatt;
-        if (!spO2MeasurementActive) return;
-        byte[] frame = JStyleFrame.spO2Measurement(false, 0);
-        readManualHistoryAfterStop = readResultAfterStop;
-        boolean accepted = hasPermissions() && activeGatt != null
-                && writeAllowlistedVendor(activeGatt, frame, "STOP");
-        if (!accepted) readManualHistoryAfterStop = false;
-        spO2MeasurementActive = false;
-        listener.onSpO2MeasurementState(spO2MeasurementAvailable, false,
-                accepted ? message : "ส่งคำสั่งหยุด SpO2 ไม่สำเร็จ");
+        return hasPermissions() && activeGatt != null
+                && writeAllowlistedVendor(activeGatt,
+                JStyleFrame.spO2Measurement(false, 0), "STOP");
     }
 
     @SuppressLint("MissingPermission")
     private void requestManualSpO2History() {
         BluetoothGatt activeGatt = gatt;
         if (!hasPermissions() || activeGatt == null || !spO2MeasurementAvailable
-                || spO2HistoryReadActive) return;
+                || spO2HistoryReadActive
+                || manualSpO2Session.snapshot().state
+                != ManualSpO2Session.State.WAITING_MANUAL_HISTORY) return;
         byte[] frame = JStyleFrame.manualSpO2HistoryRequest();
-        if (!writeAllowlistedVendor(activeGatt, frame, "READ-HISTORY-60")) return;
+        if (!writeAllowlistedVendor(activeGatt, frame, "READ-HISTORY-60")) {
+            finishManualMeasurement(manualSpO2Session.fail(),
+                    "ส่งคำสั่งอ่านผล SpO2 ไม่สำเร็จ");
+            return;
+        }
+        manualSpO2Session.markHistoryRequested();
         spO2HistoryReadActive = true;
         mainHandler.removeCallbacks(spO2HistoryTimeout);
     }
@@ -588,31 +661,45 @@ public final class PulseBleManager {
     }
 
     private void onVendorWriteComplete(String action) {
-        if ("STOP".equals(action) && readManualHistoryAfterStop) {
-            readManualHistoryAfterStop = false;
-            mainHandler.postDelayed(this::requestManualSpO2History, 300);
+        if ("START".equals(action)) {
+            manualSpO2Session.onStartWritten();
+            listener.onManualSpO2State(spO2MeasurementAvailable,
+                    manualSpO2Session.snapshot(), "กำลังวัด SpO2 · อยู่นิ่ง 30 วินาที");
             return;
         }
         if ("READ-HISTORY-60".equals(action)) {
-            mainHandler.removeCallbacks(spO2HistoryTimeout);
-            mainHandler.postDelayed(spO2HistoryTimeout, EXT_DIAGNOSTIC_TIMEOUT_MS);
+            if (manualSpO2Session.snapshot().state
+                    == ManualSpO2Session.State.WAITING_MANUAL_HISTORY) {
+                mainHandler.removeCallbacks(spO2HistoryTimeout);
+                mainHandler.postDelayed(spO2HistoryTimeout, EXT_DIAGNOSTIC_TIMEOUT_MS);
+            }
             return;
         }
         if (!isExtendedDiagnosticActive()) return;
         mainHandler.removeCallbacks(extendedDiagnosticTimeout);
         if (diagnosticState == DiagnosticState.READ_AUTO_HISTORY) {
+            autoHistorySession.onRequestWritten();
             diagnosticState = DiagnosticState.WAIT_HISTORY;
         }
-        mainHandler.postDelayed(extendedDiagnosticTimeout, EXT_DIAGNOSTIC_TIMEOUT_MS);
-        if (pendingDiagnosticResponse != null) {
-            byte[] buffered = pendingDiagnosticResponse;
-            pendingDiagnosticResponse = null;
-            mainHandler.post(() -> handleExtendedDiagnosticPacket(buffered));
+        if (diagnosticState == DiagnosticState.WAIT_HISTORY) {
+            scheduleHistoryIdleTimeout(historyTimeouts.firstResponseMs);
+            mainHandler.removeCallbacks(historyAbsoluteTimeout);
+            mainHandler.postDelayed(historyAbsoluteTimeout,
+                    historyTimeouts.absoluteSessionMs);
+        } else {
+            mainHandler.postDelayed(extendedDiagnosticTimeout, EXT_DIAGNOSTIC_TIMEOUT_MS);
+        }
+        while (!pendingDiagnosticResponses.isEmpty() && isExtendedDiagnosticActive()) {
+            handleExtendedDiagnosticPacket(pendingDiagnosticResponses.remove());
         }
     }
 
     private void startExtendedDiagnostic(String reason) {
         BluetoothGatt activeGatt = gatt;
+        if (isExtendedDiagnosticActive() || autoHistorySession.isActive()) {
+            listener.onDiagnostic("EXT-DIAG HISTORY-START BLOCKED session-active");
+            return;
+        }
         if (!hasPermissions() || activeGatt == null || !spO2MeasurementAvailable
                 || vendorWritePending) {
             listener.onDiagnostic("EXT-DIAG FAILED cannot start: transport busy or unavailable");
@@ -624,6 +711,29 @@ public final class PulseBleManager {
         listener.onDiagnostic("EXT-DIAG START reason=" + reason);
         sendExtendedDiagnostic(activeGatt, JStyleFrame.versionReadRequest(),
                 "EXT-DIAG VERSION TX", DiagnosticState.READ_VERSION);
+    }
+
+    private void finishManualMeasurement(ManualSpO2Session.Snapshot result,
+                                         String message) {
+        mainHandler.removeCallbacks(automaticSpO2Stop);
+        mainHandler.removeCallbacks(requestManualHistoryAfterFinish);
+        mainHandler.removeCallbacks(spO2HistoryTimeout);
+        spO2HistoryReadActive = false;
+        listener.onDiagnostic(String.format(Locale.US,
+                "MANUAL-SPO2 result=%s reason=%s hr=%s spo2=%s",
+                result.status, result.reason, result.heartRate, result.spO2Percent));
+        if (result.status == ManualSpO2Session.ResultStatus.SUCCEEDED
+                && result.spO2Percent != null) {
+            double pulse = result.heartRate == null ? Double.NaN : result.heartRate;
+            listener.onSpO2(result.spO2Percent, pulse);
+        }
+        listener.onManualSpO2State(spO2MeasurementAvailable, result, message);
+    }
+
+    private void maybeStartManualFailureDiagnostic(String reason) {
+        if (!DEBUG_MANUAL_FAILURE_EXT_DIAGNOSTIC || manualFallbackDiagnosticUsed) return;
+        manualFallbackDiagnosticUsed = true;
+        startExtendedDiagnostic(reason);
     }
 
     private void sendExtendedDiagnostic(BluetoothGatt activeGatt, byte[] frame,
@@ -646,7 +756,11 @@ public final class PulseBleManager {
                 || (diagnosticState == DiagnosticState.READ_AUTO_HISTORY
                         && command == JStyleFrame.AUTO_SPO2_HISTORY_COMMAND));
         if (expectedBeforeWriteCallback) {
-            pendingDiagnosticResponse = Arrays.copyOf(value, value.length);
+            if (pendingDiagnosticResponses.size() >= MAX_BUFFERED_DIAGNOSTIC_RESPONSES) {
+                failExtendedDiagnostic("too many responses before write callback");
+                return true;
+            }
+            pendingDiagnosticResponses.add(Arrays.copyOf(value, value.length));
             listener.onDiagnostic("EXT-DIAG RX buffered until write callback");
             return true;
         }
@@ -681,51 +795,68 @@ public final class PulseBleManager {
             if (activeGatt == null) {
                 failExtendedDiagnostic("disconnect");
             } else {
-                sendExtendedDiagnostic(activeGatt,
-                        JStyleFrame.autoSpO2HistoryRequest(JStyleFrame.HISTORY_READ_START),
-                        "EXT-DIAG AUTO-HISTORY TX mode=00", DiagnosticState.READ_AUTO_HISTORY);
+                if (!autoHistorySession.start()) {
+                    failExtendedDiagnostic("overlapping history session");
+                    return true;
+                }
+                listener.onDiagnostic("EXT-DIAG HISTORY-START state=requesting");
+                sendExtendedDiagnostic(activeGatt, JStyleFrame.autoSpO2HistoryStartRequest(),
+                        "EXT-DIAG HISTORY-START TX mode=00", DiagnosticState.READ_AUTO_HISTORY);
             }
             return true;
         }
 
         if (diagnosticState == DiagnosticState.WAIT_HISTORY
-                && command == JStyleFrame.AUTO_SPO2_HISTORY_COMMAND) {
-            mainHandler.removeCallbacks(extendedDiagnosticTimeout);
-            if (JStyleFrame.isAutoSpO2HistoryEnd(value)) {
-                listener.onDiagnostic("AUTO-HISTORY END records=" + autoHistoryRecords);
-                completeExtendedDiagnostic();
+                && (command == JStyleFrame.AUTO_SPO2_HISTORY_COMMAND
+                || autoHistorySession.bufferedByteCount() > 0)) {
+            AutoSpO2HistorySession.Batch batch = autoHistorySession.accept(value);
+            AutoSpO2HistorySession.TerminalResult terminal =
+                    autoHistorySession.terminalResult();
+            if (terminal != null) {
+                finishHistory(terminal);
                 return true;
             }
-            if (!JStyleFrame.isAutoSpO2HistoryRecord(value)) {
-                failExtendedDiagnostic("malformed auto-history response");
-                return true;
-            }
-            try {
-                JStyleFrame.AutoSpO2Record record = JStyleFrame.parseAutoSpO2Record(value);
-                autoHistoryRecords++;
+            if (batch.capacityReached) {
+                if ("record-limit".equals(autoHistorySession.truncationReason())) {
+                    listener.onDiagnostic(String.format(Locale.US,
+                            "EXT-DIAG HISTORY-LIMIT count=%d accepted=%d dropped=%d max=%d",
+                            autoHistorySession.recordCount(), batch.records.size(),
+                            batch.droppedByLimit, autoHistorySession.maxHistoryRecords()));
+                }
+                int limitMaximum = "record-limit".equals(autoHistorySession.truncationReason())
+                        ? autoHistorySession.maxHistoryRecords()
+                        : AutoSpO2HistorySession.MAX_NOTIFICATIONS;
                 listener.onDiagnostic(String.format(Locale.US,
-                        "AUTO-HISTORY SpO2=%d%% time=%s id=%d",
-                        record.percent, record.timestampText(), record.id));
-            } catch (IllegalArgumentException error) {
-                failExtendedDiagnostic("invalid auto-history record: " + error.getMessage());
-                return true;
+                        "EXT-DIAG HISTORY-DRAINING reason=%s max=%d",
+                        autoHistorySession.truncationReason(), limitMaximum));
+            } else if (DEBUG_AUTO_HISTORY_BATCHES
+                    && (!batch.records.isEmpty() || batch.duplicateCount > 0
+                    || batch.malformedCount > 0)) {
+                String range = "";
+                if (!batch.records.isEmpty()) {
+                    JStyleFrame.AutoSpO2Record first = batch.records.get(0);
+                    JStyleFrame.AutoSpO2Record last = batch.records.get(batch.records.size() - 1);
+                    range = String.format(Locale.US,
+                            " first=id:%d,time:%s,SpO2:%d%% last=id:%d,time:%s,SpO2:%d%%",
+                            first.id, first.timestampText(), first.percent,
+                            last.id, last.timestampText(), last.percent);
+                }
+                listener.onDiagnostic(String.format(Locale.US,
+                        "EXT-DIAG HISTORY-RECORDS count=%d new=%d duplicates=%d malformed=%d%s",
+                        autoHistorySession.recordCount(), batch.records.size(),
+                        batch.duplicateCount, batch.malformedCount, range));
             }
-            if (autoHistoryContinuations >= MAX_AUTO_HISTORY_CONTINUATIONS) {
-                listener.onDiagnostic("AUTO-HISTORY STOP continuation-limit records="
-                        + autoHistoryRecords);
-                completeExtendedDiagnostic();
-                return true;
+            if (DEBUG_AUTO_HISTORY_BATCHES && batch.bufferedBytes > 0) {
+                listener.onDiagnostic("EXT-DIAG HISTORY-FRAGMENT buffered=" + batch.bufferedBytes);
             }
-            BluetoothGatt activeGatt = gatt;
-            if (activeGatt == null) {
-                failExtendedDiagnostic("disconnect");
-            } else {
-                autoHistoryContinuations++;
-                sendExtendedDiagnostic(activeGatt,
-                        JStyleFrame.autoSpO2HistoryRequest(JStyleFrame.HISTORY_READ_CONTINUATION),
-                        "EXT-DIAG AUTO-HISTORY TX mode=02 request=" + autoHistoryContinuations,
-                        DiagnosticState.READ_AUTO_HISTORY);
+            if (DEBUG_RAW_AUTO_HISTORY) {
+                for (JStyleFrame.AutoSpO2Record record : batch.records) {
+                    listener.onDiagnostic(String.format(Locale.US,
+                            "EXT-DIAG HISTORY-RECORD historical SpO2=%d%% time=%s id=%d",
+                            record.percent, record.timestampText(), record.id));
+                }
             }
+            scheduleHistoryIdleTimeout(historyTimeouts.interPacketIdleMs);
             return true;
         }
         return false;
@@ -737,40 +868,77 @@ public final class PulseBleManager {
                 && diagnosticState != DiagnosticState.FAILED;
     }
 
-    private void completeExtendedDiagnostic() {
+    private void scheduleHistoryIdleTimeout(long delayMs) {
+        mainHandler.removeCallbacks(historyIdleTimeout);
+        mainHandler.postDelayed(historyIdleTimeout, delayMs);
+    }
+
+    private void finishHistory(AutoSpO2HistorySession.TerminalResult result) {
+        if (result == null || diagnosticState != DiagnosticState.WAIT_HISTORY) return;
+        cancelHistoryTimers();
+        String outcome = result.outcome.name().replace('_', '-');
+        String reason = result.reason.name().toLowerCase(Locale.US).replace('_', '-');
+        String completeness = result.completeness.name().toLowerCase(Locale.US);
+        listener.onDiagnostic(String.format(Locale.US,
+                "EXT-DIAG HISTORY-%s reason=%s completeness=%s count=%d packets=%d "
+                        + "duplicates=%d malformed=%d buffered=%d ignoredPackets=%d",
+                outcome, reason, completeness, autoHistorySession.recordCount(),
+                autoHistorySession.notificationCount(), autoHistorySession.duplicateCount(),
+                autoHistorySession.malformedCount(), result.bufferedBytes,
+                autoHistorySession.ignoredPacketCount()));
+        pendingDiagnosticResponses.clear();
+        diagnosticState = result.outcome == AutoSpO2HistorySession.Outcome.FAILED
+                ? DiagnosticState.FAILED : DiagnosticState.COMPLETED;
+    }
+
+    private void cancelHistoryTimers() {
         mainHandler.removeCallbacks(extendedDiagnosticTimeout);
-        diagnosticState = DiagnosticState.COMPLETED;
-        listener.onDiagnostic("EXT-DIAG COMPLETED");
+        mainHandler.removeCallbacks(historyIdleTimeout);
+        mainHandler.removeCallbacks(historyAbsoluteTimeout);
     }
 
     private void failExtendedDiagnostic(String reason) {
-        mainHandler.removeCallbacks(extendedDiagnosticTimeout);
+        if (diagnosticState == DiagnosticState.WAIT_HISTORY
+                && autoHistorySession.isActive()) {
+            autoHistorySession.fail();
+            finishHistory(autoHistorySession.terminalResult());
+            return;
+        }
+        cancelHistoryTimers();
+        autoHistorySession.fail();
+        pendingDiagnosticResponses.clear();
         diagnosticState = DiagnosticState.FAILED;
         listener.onDiagnostic("EXT-DIAG FAILED reason=" + reason);
     }
 
     private void resetExtendedDiagnostic() {
-        mainHandler.removeCallbacks(extendedDiagnosticTimeout);
+        cancelHistoryTimers();
         diagnosticState = DiagnosticState.IDLE;
-        autoHistoryRecords = 0;
-        autoHistoryContinuations = 0;
-        pendingDiagnosticResponse = null;
+        autoHistorySession.reset();
+        pendingDiagnosticResponses.clear();
     }
 
     @SuppressLint("MissingPermission")
     private void closeGatt() {
         BluetoothGatt activeGatt = gatt;
-        if (isExtendedDiagnosticActive()) failExtendedDiagnostic("disconnect");
+        if (autoHistorySession.isActive()
+                && diagnosticState == DiagnosticState.WAIT_HISTORY) {
+            finishHistory(autoHistorySession.disconnect());
+        } else if (isExtendedDiagnosticActive()) failExtendedDiagnostic("disconnect");
+        else autoHistorySession.disconnect();
         gatt = null;
         mainHandler.removeCallbacks(automaticSpO2Stop);
+        mainHandler.removeCallbacks(requestManualHistoryAfterFinish);
         mainHandler.removeCallbacks(spO2HistoryTimeout);
+        if (manualSpO2Session.snapshot().isBusy()) {
+            finishManualMeasurement(manualSpO2Session.disconnect(),
+                    "การวัด SpO2 หยุดเพราะอุปกรณ์ตัดการเชื่อมต่อ");
+        }
         subscriptionsReady = false;
         spO2MeasurementAvailable = false;
-        spO2MeasurementActive = false;
         spO2HistoryReadActive = false;
         vendorWritePending = false;
         pendingVendorAction = "";
-        readManualHistoryAfterStop = false;
         if (activeGatt != null && hasPermissions()) {
             try {
                 activeGatt.disconnect();

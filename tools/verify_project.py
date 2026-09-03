@@ -9,11 +9,14 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = (ROOT / "app/src/main/AndroidManifest.xml").read_text(encoding="utf-8")
 BLE = (ROOT / "app/src/main/java/com/unclebanana/pulseone/ble/PulseBleManager.java").read_text(encoding="utf-8")
+MAIN = (ROOT / "app/src/main/java/com/unclebanana/pulseone/MainActivity.java").read_text(encoding="utf-8")
+DATABASE = (ROOT / "app/src/main/java/com/unclebanana/pulseone/data/MeasurementDb.java").read_text(encoding="utf-8")
 CORE = ROOT / "core/src/main/java/com/unclebanana/pulseone/core"
 ROOT_BUILD = (ROOT / "build.gradle").read_text(encoding="utf-8")
 APP_BUILD = (ROOT / "app/build.gradle").read_text(encoding="utf-8")
 WRAPPER = (ROOT / "gradle/wrapper/gradle-wrapper.properties").read_text(encoding="utf-8")
 JSTYLE = (ROOT / "core/src/main/java/com/unclebanana/pulseone/core/JStyleFrame.java").read_text(encoding="utf-8")
+AUTO_HISTORY = (ROOT / "core/src/main/java/com/unclebanana/pulseone/core/AutoSpO2HistorySession.java").read_text(encoding="utf-8")
 
 errors = []
 
@@ -50,8 +53,8 @@ if "0x99" in BLE or "0x99" in JSTYLE:
     errors.append("History delete mode must not be present in production vendor code")
 if "JSTYLE_NOTIFY = uuid16(0xFFF7)" not in BLE:
     errors.append("FFF7 notify characteristic is missing")
-if "versionName '0.2.5'" not in APP_BUILD or "versionCode 6" not in APP_BUILD:
-    errors.append("App version must be 0.2.5 (code 6)")
+if "versionName '0.2.8'" not in APP_BUILD or "versionCode 9" not in APP_BUILD:
+    errors.append("App version must be 0.2.8 (code 9)")
 if "MANUAL_SPO2_HISTORY_COMMAND = 0x60" not in JSTYLE:
     errors.append("Read-only manual SpO2 history command is missing")
 if "manualSpO2HistoryRequest()" not in BLE:
@@ -61,21 +64,66 @@ diagnostic_requirements = {
     "AUTO_CONFIG_READ_COMMAND = 0x2B": "Auto SpO2 config read command is missing",
     "AUTO_SPO2_HISTORY_COMMAND = 0x66": "Auto SpO2 history read command is missing",
     "HISTORY_READ_START = 0x00": "Auto-history start mode is missing",
-    "HISTORY_READ_CONTINUATION = 0x02": "Auto-history continuation mode is missing",
     "isReadOnlyDiagnosticRequest": "Read-only diagnostic allowlist is missing",
 }
 for marker, message in diagnostic_requirements.items():
     if marker not in JSTYLE:
         errors.append(message)
 for request_call in ("versionReadRequest()", "autoSpO2ConfigReadRequest()",
-                     "autoSpO2HistoryRequest(JStyleFrame.HISTORY_READ_START)",
-                     "autoSpO2HistoryRequest(JStyleFrame.HISTORY_READ_CONTINUATION)"):
+                     "autoSpO2HistoryStartRequest()"):
     if request_call not in BLE:
         errors.append(f"Read-only command does not flow through BLE state machine: {request_call}")
-if "MAX_AUTO_HISTORY_CONTINUATIONS = 10" not in BLE:
-    errors.append("Auto-history continuation must be capped at 10")
-if "parseAutoSpO2Record" not in BLE or "listener.onSpO2(record" in BLE:
+if "AutoSpO2HistorySession" not in BLE or "autoHistorySession.accept(value)" not in BLE:
+    errors.append("BLE history flow must use the bounded Auto SpO2 session")
+if "autoHistorySession.bufferedByteCount() > 0" not in BLE:
+    errors.append("BLE history flow must route continuation fragments to the session buffer")
+for state in ("IDLE", "REQUESTING", "RECEIVING", "DRAINING", "COMPLETED",
+              "INCOMPLETE", "TRUNCATED", "FAILED"):
+    if state not in AUTO_HISTORY:
+        errors.append(f"Auto-history session state is missing: {state}")
+if "DEFAULT_MAX_HISTORY_RECORDS = 4096" not in AUTO_HISTORY:
+    errors.append("Default Auto-history capacity must be 4096 records")
+if "MAX_HISTORY_RECORDS = 65_536" not in AUTO_HISTORY:
+    errors.append("Configurable Auto-history capacity must have a hard upper bound")
+if "droppedByLimit" not in AUTO_HISTORY or "ignoredPacketCount" not in AUTO_HISTORY:
+    errors.append("Auto-history capacity and suppressed packets must have separate counters")
+if "MAX_NOTIFICATIONS = 512" not in AUTO_HISTORY:
+    errors.append("Auto-history notifications and absolute session duration must be bounded")
+for timeout in ("new Timeouts(4_000, 4_000, 20_000)", "firstResponseMs",
+                "interPacketIdleMs", "absoluteSessionMs"):
+    if timeout not in AUTO_HISTORY:
+        errors.append(f"Auto-history timeout configuration is missing: {timeout}")
+if "AutoSpO2HistorySession.Timeouts historyTimeouts" not in BLE:
+    errors.append("BLE history timeouts must support validated configuration injection")
+if "HISTORY_READ_CONTINUATION" in JSTYLE or "mode=02" in BLE:
+    errors.append("Auto-history continuation must not be generated after notifications")
+if "0x02" in JSTYLE[JSTYLE.find("isReadOnlyDiagnosticRequest"):JSTYLE.find("isSpO2MeasurementResponse")]:
+    errors.append("Auto-history continuation must not be in the read-only allowlist")
+history_handler = BLE[BLE.find("private boolean handleExtendedDiagnosticPacket"):
+                      BLE.find("private boolean isExtendedDiagnosticActive")]
+if "parseAutoSpO2" not in AUTO_HISTORY or "listener.onSpO2(" in history_handler:
     errors.append("Auto-history must be parsed for diagnostic logging only")
+if "AutoSpO2History" in MAIN + DATABASE or "auto_spo2" in (MAIN + DATABASE).lower():
+    errors.append("Auto SpO2 history must not update current UI or measurement storage")
+if "DEBUG_RAW_AUTO_HISTORY = false" not in BLE:
+    errors.append("Raw Auto SpO2 history logging must be disabled by default")
+if "DEBUG_AUTO_HISTORY_BATCHES = false" not in BLE:
+    errors.append("Per-packet Auto SpO2 history summaries must be disabled by default")
+if "HISTORY-DRAINING" not in BLE:
+    errors.append("Auto-history capacity must use draining and truncated diagnostics")
+for result in ("EXPLICIT_MARKER", "IDLE_INFERRED", "EMPTY_RESPONSE_TIMEOUT",
+               "STALLED_PARTIAL", "RECORD_LIMIT", "DISCONNECTED", "PROTOCOL_ERROR"):
+    if result not in AUTO_HISTORY:
+        errors.append(f"Auto-history terminal reason is missing: {result}")
+if "EXT-DIAG HISTORY-TIMEOUT" in BLE:
+    errors.append("History idle completion must not be reported as HISTORY-TIMEOUT")
+if 'listener.onDiagnostic("EXT-DIAG COMPLETED")' in BLE:
+    errors.append("History sync must not emit a contradictory generic completion")
+for timer in ("historyIdleTimeout", "historyAbsoluteTimeout"):
+    if f"removeCallbacks({timer})" not in BLE:
+        errors.append(f"History terminal cleanup must cancel {timer}")
+if "DEVICE_TIME_COMMAND" in JSTYLE or "DEVICE-TIME TX" in BLE:
+    errors.append("Device-time command 0x41 must not be sent without a confirmed layout")
 if "version '8.13.2'" not in ROOT_BUILD:
     errors.append("AGP must be pinned to 8.13.2")
 if "gradle-8.13-bin.zip" not in WRAPPER:
@@ -101,6 +149,7 @@ required = [
     ROOT / "app/src/main/java/com/unclebanana/pulseone/data/MeasurementDb.java",
     CORE / "BleParsers.java",
     CORE / "JStyleFrame.java",
+    CORE / "AutoSpO2HistorySession.java",
 ]
 for path in required:
     if not path.is_file():
